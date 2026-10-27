@@ -57,6 +57,10 @@ do -- globals
 	gPlayState = 'STOP' -- engine state: PLAY | PAUSE | STOP
 	gElapsedSec = 0     -- driver-side clockwork; the engine sends no progress
 	gNextArmed = nil    -- queue index currently armed as the engine's NEXT_URL
+	gNextArmedMode = nil -- 'direct' | 'transcode': how the armed NEXT_URL was built
+	gCurMode = nil      -- same, for the stream the engine is playing now
+	gStreamStartSec = 0 -- track position the current stream started at (0, or a seek/resume offset)
+	gRecoverTries = 0   -- recovery restarts already spent on the current track
 	gEndStreak = 0      -- consecutive END-fallback selects with no adopted PLAY
 	gShuffle = false
 	gRepeat = false
@@ -111,6 +115,10 @@ do -- globals
 	AWAIT_QUEUE_TIMEOUT_MS = 10000 -- await window closes even with no reply
 	DEAD_IDS_MAX = 8    -- remembered replaced-queue ids
 	END_STREAK_MAX = 25 -- END-fallback selects tolerated with no PLAY between
+	RECOVER_MAX = 2     -- recovery restarts per track before the queue moves on
+	EARLY_END_MARGIN_S = 15 -- a stream ending this far (or 5%) short of the track length died early
+	RESUME_MIN_PLAYED_S = 5 -- a transcode must have really played this long to be worth resuming
+	RESUME_BACKUP_S = 2 -- resume a dropped stream this far before where the driver clock says it died
 	TRACK_FIELD_MAX = 256 -- per-field cap on mirrored/persisted track strings
 end
 
@@ -285,12 +293,18 @@ local function trackFromRow (row)
 	}
 	for _, media in ipairs (row.children) do
 		if (media.tag == 'Media') then
-			t.codec = capField (media.attrs.audioCodec)
+			t.codec = capField (media.attrs.audioCodec):lower ()
+			t.container = capField (media.attrs.container):lower ()
 			for _, part in ipairs (media.children) do
 				if (part.tag == 'Part') then
 					-- part keys run longer than display fields but are still
 					-- bounded: they ride in every queue mirror and persist
 					t.partKey = tostring (part.attrs.key or ''):sub (1, 512)
+					-- the Part's container is the actual file on disk; prefer
+					-- it over the Media summary when the server sends both
+					if (part.attrs.container and part.attrs.container ~= '') then
+						t.container = capField (part.attrs.container):lower ()
+					end
 					break
 				end
 			end
@@ -300,10 +314,17 @@ local function trackFromRow (row)
 	return (t.rk ~= '') and t or nil
 end
 
--- codecs the Digital Audio engine is trusted to direct-play. Conservative on
--- purpose; anything else goes through the server transcode. UNVERIFIED list -
--- bench will refine it.
-local DIRECT_CODECS = {mp3 = true, aac = true, flac = true}
+-- codec -> the file containers the Digital Audio engine is trusted to
+-- direct-play it from. 1.0.0 checked the codec alone, so an AAC track in an
+-- .mka or .ts, or FLAC inside .ogg, went out as a raw file the engine could
+-- not open. Conservative on purpose; anything else goes through the server
+-- transcode, and a direct stream that fails anyway is retried as a transcode
+-- (see the recovery section). UNVERIFIED list - bench will refine it.
+local DIRECT_FORMATS = {
+	mp3 = {mp3 = true},
+	aac = {mp4 = true, m4a = true, aac = true},
+	flac = {flac = true},
+}
 
 local function playbackMode ()
 	local p = tostring (Properties and Properties ['Playback'] or '')
@@ -312,13 +333,31 @@ local function playbackMode ()
 	return 'transcode', kbps
 end
 
+local function directPlayable (track)
+	-- forceTranscode is set when a direct stream of this track already failed
+	if (track.forceTranscode or not track.partKey or track.partKey == '') then return false end
+	local containers = DIRECT_FORMATS [tostring (track.codec or ''):lower ()]
+	if (not containers) then return false end
+	-- a row with no container (some listings omit it, and tracks persisted by
+	-- 1.0.0 never stored one) keeps the old codec-only behavior; the
+	-- direct-play recovery catches a bad one
+	local c = tostring (track.container or ''):lower ()
+	return (c == '') or (containers [c] == true)
+end
+
+-- the mode a track WOULD stream in right now, without building a URL
+local function streamMode (track)
+	if (track and playbackMode () == 'direct' and directPlayable (track)) then return 'direct' end
+	return 'transcode'
+end
+
 -- Returns url, mode ('direct'|'transcode'). positionSec is baked into the
 -- transcode URL only (progressive transcodes restart at an offset; direct
 -- play seeks via the engine's POSITION instead). A direct-play track whose
 -- Part key fails validation falls back to the transcode rather than failing.
 local function urlForTrack (track, positionSec)
-	local mode, kbps = playbackMode ()
-	if (mode == 'direct' and track.partKey and DIRECT_CODECS [tostring (track.codec)]) then
+	local _, kbps = playbackMode ()
+	if (streamMode (track) == 'direct') then
 		local url = Plex.DirectUrl (track.partKey)
 		if (url) then return url, 'direct' end
 	end
@@ -351,8 +390,10 @@ local function normalizeTrack (t)
 	t.album = capField (t.album)
 	t.durSec = math.max (0, math.floor (tonumber (t.durSec) or 0))
 	t.thumb = capField (t.thumb)
-	t.codec = t.codec and capField (t.codec) or nil
+	t.codec = t.codec and capField (t.codec):lower () or nil
+	t.container = t.container and capField (t.container):lower () or nil
 	t.partKey = t.partKey and tostring (t.partKey):sub (1, 512) or nil
+	t.forceTranscode = (t.forceTranscode == true) or nil
 	return t
 end
 
@@ -533,11 +574,13 @@ local function armNext (force)
 	if (not gQueueId and not gAwaitQueueId) then return end
 	local nx = nextIndex (gIndex)
 	if (not force and nx == gNextArmed) then return end
-	local url = ''
+	local url, mode = '', nil
 	if (nx) then
-		url = urlForTrack (gQueue [nx]) or ''
+		local u, m = urlForTrack (gQueue [nx])
+		if (u) then url, mode = u, m end
 	end
 	gNextArmed = (url ~= '') and nx or nil
+	gNextArmedMode = (url ~= '') and mode or nil
 	C4:SendToProxy (MSP, 'SET_NEXT_AUDIO_URL', {
 		ROOM_ID = gRooms,
 		REPORT_ERRORS = true,
@@ -652,8 +695,10 @@ local function closeAwaitWindow (adoptedId)
 end
 
 -- play gQueue[idx] in roomId (numeric CSV). positionSec restarts mid-track.
+-- recovering marks a restart of the SAME track by the recovery code, which
+-- must not hand the track a fresh recovery budget.
 -- Returns ok, reason ('noroom'|'nourl') so callers can name the failure.
-local function playIndex (idx, roomId, positionSec)
+local function playIndex (idx, roomId, positionSec, recovering)
 	-- any select supersedes a debounced seek still waiting to fire; letting
 	-- it fire afterwards would yank the fresh selection to a stale offset
 	CancelTimer ('c4plexSeek')
@@ -672,6 +717,9 @@ local function playIndex (idx, roomId, positionSec)
 	gIndex = idx
 	gRooms = roomId
 	gElapsedSec = pos
+	gStreamStartSec = pos
+	gCurMode = mode
+	if (not recovering) then gRecoverTries = 0 end
 	gNextArmed = nil
 	-- every SELECT is a fresh correlation epoch: a skip replaces the engine
 	-- queue just like a queue replace does, and the old queue's stragglers
@@ -699,6 +747,59 @@ local function playIndex (idx, roomId, positionSec)
 	armNext (true)
 	maybeRefillRadio (roomId) -- a radio queue nearing its end gets another batch
 	return true
+end
+
+-- ---- stream recovery -------------------------------------------------------
+-- 1.0.0 treated any stream failure as "track over": the engine shows Network
+-- Failure / Server cannot be reached / Track cannot be found, and the driver
+-- either stops or moves to the next track, so the same songs fail every time.
+-- Two failures are worth one more try on the same track:
+--   * a DIRECT stream that the engine refused or that died early: the file
+--     is not one the engine can use (container/format), or its Part key went
+--     stale after a rescan (a 404 on /library/parts). The transcode path
+--     resolves the current file server-side and outputs plain MP3, so the
+--     track is retried as a transcode and flagged to transcode from then on.
+--   * a TRANSCODE stream that genuinely played and then dropped mid-track:
+--     resumed from where it died instead of skipping the rest of the song.
+-- A transcode that never got going is not retried (it will not do better),
+-- and RECOVER_MAX caps the restarts per track, so a dead track still moves on.
+
+-- did the current stream stop well short of the track's length? The driver
+-- clock only runs in PLAY, so a stream that never started reads as 0s.
+local function endedEarly (t)
+	local dur = tonumber (t and t.durSec) or 0
+	if (dur <= 0) then
+		-- unknown length: only "never got going" is provable
+		return (gElapsedSec - gStreamStartSec) < 3
+	end
+	return gElapsedSec + math.max (EARLY_END_MARGIN_S, math.floor (dur / 20)) < dur
+end
+
+-- restart the current track as a transcode after its direct stream failed.
+-- Returns true when the retry was sent.
+local function retryAsTranscode (why)
+	local t = currentTrack ()
+	if (not t or gCurMode ~= 'direct' or gRecoverTries >= RECOVER_MAX) then return false end
+	t.forceTranscode = true
+	gRecoverTries = gRecoverTries + 1
+	Debug.Warn ('direct play of', t.title, why, '- retrying it as a transcode')
+	local resumeAt = math.max (gStreamStartSec, gElapsedSec - RESUME_BACKUP_S)
+	return (playIndex (gIndex, gRooms, resumeAt, true)) == true
+end
+
+-- an END that arrived well before the current track should have finished.
+-- Returns true when a recovery select was sent (the caller must not advance).
+local function recoverEarlyEnd ()
+	local t = currentTrack ()
+	if (not t or gRecoverTries >= RECOVER_MAX or not endedEarly (t)) then return false end
+	if (gCurMode == 'direct') then
+		return retryAsTranscode ('ended early')
+	end
+	if (gElapsedSec - gStreamStartSec < RESUME_MIN_PLAYED_S) then return false end
+	gRecoverTries = gRecoverTries + 1
+	local resumeAt = math.max (0, gElapsedSec - RESUME_BACKUP_S)
+	Debug.Warn ('stream for', t.title, 'dropped at', gElapsedSec, 's - resuming at', resumeAt)
+	return (playIndex (gIndex, gRooms, resumeAt, true)) == true
 end
 
 -- replace the queue with `tracks` and start at startIdx; the queue is only
@@ -2104,6 +2205,7 @@ end
 -- rebuilds it; the pause itself is the engine's job.
 local function clearNextArmed ()
 	gNextArmed = nil
+	gNextArmedMode = nil
 	if (validRooms (gRooms)) then
 		C4:SendToProxy (MSP, 'SET_NEXT_AUDIO_URL', {
 			ROOM_ID = gRooms, REPORT_ERRORS = true, QUEUE_INFO = '',
@@ -2424,6 +2526,9 @@ RFP.QUEUE_STATE_CHANGED = function (idBinding, strCommand, tParams)
 		-- stream fails (repeat wrap would otherwise cycle forever).
 		gPlayState = 'STOP'
 		stopTicker ()
+		-- a stream that died well short of the song gets one more go at the
+		-- SAME track (transcode fallback or resume) before the queue moves on
+		if (recoverEarlyEnd ()) then return end
 		local nx = nextIndex (gIndex)
 		if (nx) then
 			gEndStreak = gEndStreak + 1
@@ -2462,20 +2567,33 @@ RFP.QUEUE_NEED_NEXT = function (idBinding, strCommand, tParams)
 		if (gQueueId) then armNext (true) end
 		return
 	end
-	local idx
+	local idx, mode
 	if (gNextArmed) then
 		if (echoed and echoed ~= gNextArmed) then
 			Debug.Trace ('stale QUEUE_NEED_NEXT for', echoed, '(armed', gNextArmed, '); ignoring')
 			return
 		end
 		idx = gNextArmed
+		mode = gNextArmedMode
 	elseif (echoed and gen and gQueue [echoed]) then
 		idx = echoed
 	else
 		Debug.Trace ('QUEUE_NEED_NEXT with nothing armed and no usable echo; ignoring')
 		return
 	end
+	-- the engine jumped to the armed next while the outgoing track was
+	-- nowhere near its end. For a direct-played track that means the engine
+	-- could not use the file; the next song is already playing so it is not
+	-- yanked back, but it transcodes the next time it comes up.
+	local out = currentTrack ()
+	if (out and gCurMode == 'direct' and endedEarly (out)) then
+		out.forceTranscode = true
+		Debug.Warn ('direct play of', out.title, 'ended early; it will be transcoded from now on')
+	end
 	gIndex = idx
+	gCurMode = mode or streamMode (gQueue [idx])
+	gStreamStartSec = 0
+	gRecoverTries = 0
 	gNextArmed = nil
 	gElapsedSec = 0
 	persistQueue ()
@@ -2625,6 +2743,9 @@ local function selectError (idBinding, strCommand, tParams)
 		-- deserves the toast, and the arm sent with the failed select must
 		-- not stand against whatever the timeout restored
 		Debug.Error ('late SELECT_AUDIO_URL error:', scrubToken (tParams and tParams.ERROR))
+		-- a slow refusal (the engine gave up on an unreachable/unusable
+		-- direct URL after the window closed) still gets the transcode retry
+		if (retryAsTranscode ('was refused')) then return end
 		notifyUser ('Plex Music', 'Control4 could not start the stream')
 		gNextArmed = nil
 		armNext (true)
@@ -2640,16 +2761,21 @@ local function selectError (idBinding, strCommand, tParams)
 	local pendingDelete = gPendingDeleteRooms
 	closeAwaitWindow (nil)
 	Debug.Error ('SELECT_AUDIO_URL error:', scrubToken (tParams and tParams.ERROR))
-	notifyUser ('Plex Music', 'Control4 could not start the stream')
-	if (pendingDelete and (pendingDelete == '' or gRooms == ''
-			or roomsOverlap (pendingDelete, gRooms))) then
+	local deleted = pendingDelete and (pendingDelete == '' or gRooms == ''
+		or roomsOverlap (pendingDelete, gRooms))
+	-- settle the displaced queue FIRST (dead, or restored as live), so a
+	-- retry select below displaces it properly instead of orphaning it
+	if (deleted) then
 		applyQueueDeleted ()
-		return
-	end
-	if (restore) then
+	elseif (restore) then
 		gDeadQueueIds [restore] = nil
 		gQueueId = restore
 	end
+	-- a refused direct-play URL gets one transcode retry before the user
+	-- hears about it
+	if (retryAsTranscode ('was refused')) then return end
+	notifyUser ('Plex Music', 'Control4 could not start the stream')
+	if (deleted) then return end
 	gNextArmed = nil
 	armNext (true) -- explicit clear/re-arm against whatever is actually live
 end

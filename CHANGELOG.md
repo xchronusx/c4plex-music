@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1 - Stream dropout fixes
+
+Fixes songs that refuse to play or cut out with "Network Failure", "Server
+cannot be reached" or "Track cannot be found".
+
+- Transcode session ids are now unique per stream. 1.0.0 reused one session
+  per track, so seeking, restarting a track, repeat on a one-track queue, a
+  duplicate track next in line, or replaying a recent track opened a second
+  request on a live transcoder job and killed the stream.
+- Direct Play now checks the file container as well as the codec (MP3 in
+  .mp3, AAC in .m4a/.mp4/.aac, FLAC in .flac). Anything else transcodes.
+- A direct-played track that is refused by the engine or dies early (format
+  the engine can't use, or a Part key gone stale after a library rescan) is
+  retried once as a transcode, and transcodes from then on.
+- A transcoded stream that drops mid-song resumes from where it stopped
+  instead of skipping to the next track. Retries are capped per track.
+
 ## 1.0.0 - Initial release
 
 A native Control4 media service that streams a Plex Media Server's music library

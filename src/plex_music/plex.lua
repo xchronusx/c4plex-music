@@ -22,6 +22,7 @@ local gHost, gPort, gToken = nil, 32400, nil
 local gClientId = 'c4plex-unconfigured'
 local gMachineId = '' -- server machineIdentifier, learned from ServerInfo; needed
                       -- to build the station play-queue uri
+local gStreamSerial = 0 -- bumped per transcode URL so no two URLs share a session
 
 local REQUEST_TIMEOUT_S = 15
 
@@ -742,6 +743,19 @@ end
 -- byte-range seek reliably).
 function Plex.TranscodeUrl (ratingKey, maxKbps, offsetSec)
 	if (not ratingKey or ratingKey == '') then return nil end
+	-- session id is per URL, not per track. The server holds one transcoder
+	-- job per session and a second request on a live session kills the first
+	-- one's stream. Keying it on the rating key alone (1.0.0) still collided
+	-- whenever the SAME track was asked for twice: every seek and restart
+	-- (new select while the old stream is torn down), repeat on a one-track
+	-- queue or a duplicate track next in line (the engine pre-fetches the
+	-- next URL while the current one is still playing), and replaying a track
+	-- whose old job had not expired yet. The serial makes each URL its own
+	-- job; the time stamp keeps ids from repeating across a driver reload,
+	-- when the serial starts over. Abandoned jobs expire server-side as before.
+	gStreamSerial = gStreamSerial + 1
+	local session = string.format ('%s-%s-%x%x', gClientId, tostring (ratingKey),
+		os.time (), gStreamSerial)
 	local params = {
 		path = '/library/metadata/' .. tostring (ratingKey),
 		mediaIndex = '0',
@@ -752,11 +766,7 @@ function Plex.TranscodeUrl (ratingKey, maxKbps, offsetSec)
 		hasMDE = '1',
 		audioCodec = 'mp3',
 		maxAudioBitrate = tostring (maxKbps or 320),
-		-- session id is per TRACK: the server holds one transcoder job per
-		-- session, so if the current track and the engine's pre-fetched next
-		-- URL shared one session, opening the next would kill the current
-		-- stream mid-play. Stale per-track sessions expire server-side.
-		session = gClientId .. '-' .. tostring (ratingKey),
+		session = session,
 	}
 	if (tonumber (offsetSec) and tonumber (offsetSec) > 0) then
 		params.offset = tostring (math.floor (tonumber (offsetSec)))

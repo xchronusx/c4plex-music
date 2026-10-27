@@ -33,9 +33,15 @@ Control4 controller is the renderer.</p>
 	<li><b>Transcode (MP3 320/192/128 kbps)</b>: the Plex server transcodes
 	every track to a plain MP3 stream. The most compatible choice.</li>
 	<li><b>Direct Play When Possible</b> (default): attempts to stream MP3,
-	AAC, and FLAC files as original bytes for the fastest start; other
-	formats fall back to the MP3 transcode.</li>
+	AAC (.m4a/.mp4/.aac), and FLAC (.flac) files as original bytes for the
+	fastest start; other formats and containers fall back to the MP3
+	transcode. If a direct-played track fails to start or cuts out early, the
+	driver retries it once as a transcode and keeps transcoding that track
+	from then on.</li>
 </ul>
+<p>If a transcoded stream drops partway through a song, the driver resumes
+it from where it stopped instead of skipping ahead. A track that still will
+not play after a retry is skipped as before.</p>
 
 <h2>Features</h2>
 <ul>
